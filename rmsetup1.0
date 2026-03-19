@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# =============================================================================
+# setup_ssh.sh — Reproducible SSH config setup
+# Usage: ./setup_ssh.sh [OPTIONS]
+# =============================================================================
+
+set -euo pipefail
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'
+
+log()    { echo -e "${GREEN}[✔]${RESET} $*"; }
+warn()   { echo -e "${YELLOW}[!]${RESET} $*"; }
+error()  { echo -e "${RED}[✘]${RESET} $*" >&2; exit 1; }
+header() { echo -e "\n${BOLD}${BLUE}── $* ──${RESET}"; }
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+SSH_DIR="${HOME}/.ssh"
+CONFIG_FILE="${SSH_DIR}/config"
+PORT=2222
+KEY_TYPE="ed25519"           # ed25519 (recommended) or rsa
+KEY_BITS=4096                # only used when KEY_TYPE=rsa
+BACKUP=true                  # back up existing config before editing
+GITHUB_USER=""               # GitHub username
+# GITHUB_TOKEN is read from the environment — never passed as a CLI arg.
+# Export it before running:  export GITHUB_TOKEN="ghp_..."
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+# Feature flags
+HARDEN_SERVER=false
+ALLOW_FORWARDING=false
+HARDEN_CRYPTO=false
+HARDEN_MODULI=false
+SFTP_GROUP=""
+INTERNAL_CIDR=""
+ADMIN_GROUP=""
+MANAGEMENT_PORT=""
+FORCE_COMMAND=""
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+FROM_IP=""
+SETUP_FAIL2BAN=false
+SETUP_TOTP=false
+VALIDATE_ONLY=false
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+usage() {
+cat <<EOF
+${BOLD}setup_ssh.sh${RESET} — Reproducible SSH config setup
+
+${BOLD}USAGE${RESET}
+  ./setup_ssh.sh [OPTIONS]
+
+${BOLD}REQUIRED${RESET}
+  -h, --host-addr   HOST_ADDR   Real hostname or IP                (e.g. 192.168.1.10)
+  -u, --user        USER_NAME   Remote SSH user                    (e.g. git)
+
+${BOLD}OPTIONAL${RESET}
+  -n, --host-name   HOST_NAME   Alias used in ssh / git commands  [default: $(hostname -s 2>/dev/null || hostname)]
+  -k, --key-file      KEY_FILE   Path to private key  [default: ~/.ssh/id_<type>_<host-name>]
+  -p, --port          PORT       SSH port             [default: ${PORT}]
+  -t, --key-type      TYPE       ed25519 | rsa        [default: ${KEY_TYPE}]
+  -b, --bits          BITS       RSA key bits         [default: ${KEY_BITS}]
+      --no-backup                Skip config backup
+
+${BOLD}GITHUB${RESET}
+  -g, --github-user   GH_USER    Your GitHub username — generates a curl one-liner
+
+  The GitHub PAT is read from the ${BOLD}GITHUB_TOKEN${RESET} environment variable.
+  Never pass it as a CLI arg (it leaks into ps/history).
+  Export it before running:
+    ${YELLOW}export GITHUB_TOKEN="ghp_..."${RESET}
+  Or prefix the call:
+    ${YELLOW}GITHUB_TOKEN="ghp_..." ./setup_ssh.sh -g myuser ...${RESET}
+
+${BOLD}SERVER HARDENING${RESET}
+      --harden-server            Edit /etc/ssh/sshd_config on THIS machine with secure settings
+      --allow-forwarding         Opt-in agent/TCP forwarding (not default)
+      --harden-crypto            Cipher/KEX/MAC hardening
+      --harden-moduli            Strip weak DH groups from /etc/moduli
+      --sftp-group GROUP         Generate SFTP chroot Match block for this group
+      --internal-cidr CIDR       Network range to allow password auth from
+      --admin-group GROUP        Group that gets elevated permissions
+      --management-port PORT     Port the admin group connects on
+      --force-command CMD        Lock user/key to one command (used in authorized_keys)
+      --allow-users USERS        Comma-separated AllowUsers whitelist
+      --allow-groups GROUPS      Comma-separated AllowGroups whitelist
+      --from-ip IP               Restrict key to source IP (used in authorized_keys)
+      --fail2ban                 Install + configure fail2ban
+      --totp                     Install libpam-google-authenticator, configure
+                                 PAM + sshd, then run google-authenticator for
+                                 the current user (generates QR code + secret).
+                                 Best used alongside --harden-server.
+      --validate                 Run post-install checks only
+
+      --help                     Show this help
+EOF
+exit 0
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+HOST_NAME="$(hostname -s 2>/dev/null || hostname)"; HOST_ADDR=""; USER_NAME=""; KEY_FILE=""
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--host-name)    HOST_NAME="$2";    shift 2 ;;
+      -h|--host-addr)    HOST_ADDR="$2";    shift 2 ;;
+      -u|--user)         USER_NAME="$2";    shift 2 ;;
+      -k|--key-file)     KEY_FILE="$2";     shift 2 ;;
+      -p|--port)         PORT="$2";         shift 2 ;;
+      -t|--key-type)     KEY_TYPE="$2";     shift 2 ;;
+      -b|--bits)         KEY_BITS="$2";     shift 2 ;;
+      -g|--github-user)  GITHUB_USER="$2";  shift 2 ;;
+      --harden-server)   HARDEN_SERVER=true; shift  ;;
+      --no-backup)       BACKUP=false;      shift   ;;
+      --allow-forwarding) ALLOW_FORWARDING=true; shift ;;
+      --harden-crypto)   HARDEN_CRYPTO=true; shift ;;
+      --harden-moduli)   HARDEN_MODULI=true; shift ;;
+      --sftp-group)      SFTP_GROUP="$2"; shift 2 ;;
+      --internal-cidr)   INTERNAL_CIDR="$2"; shift 2 ;;
+      --admin-group)     ADMIN_GROUP="$2"; shift 2 ;;
+      --management-port) MANAGEMENT_PORT="$2"; shift 2 ;;
+      --force-command)   FORCE_COMMAND="$2"; shift 2 ;;
+      --allow-users)     ALLOW_USERS="$2"; shift 2 ;;
+      --allow-groups)    ALLOW_GROUPS="$2"; shift 2 ;;
+      --from-ip)         FROM_IP="$2"; shift 2 ;;
+      --fail2ban)        SETUP_FAIL2BAN=true; shift ;;
+      --totp)            SETUP_TOTP=true;     shift ;;
+      --validate)        VALIDATE_ONLY=true; shift ;;
+      --help)            usage ;;
+      *) error "Unknown option: $1  (run with --help)" ;;
+    esac
+  done
+}
+
+validate_required_args() {
+  [[ -z "$HOST_ADDR" ]] && error "Missing --host-addr"
+  [[ -z "$USER_NAME" ]] && error "Missing --user"
+  [[ "$KEY_TYPE" =~ ^(ed25519|rsa)$ ]] || error "KEY_TYPE must be ed25519 or rsa"
+
+  [[ -z "$KEY_FILE" ]] && KEY_FILE="${SSH_DIR}/id_${KEY_TYPE}_${HOST_NAME}"
+}
+
+setup_ssh_dir() {
+  header "SSH directory"
+  if [[ ! -d "$SSH_DIR" ]]; then
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    log "Created ${SSH_DIR}"
+  else
+    log "${SSH_DIR} already exists"
+  fi
+}
+
+prompt_passphrase() {
+  # Prompt for a passphrase (with confirmation) and export KEY_PASSPHRASE.
+  # Pass a label as $1 so the user knows which key they are protecting.
+  local label="${1:-SSH key}"
+  local pass1 pass2
+  while true; do
+    read -r -s -p "$(echo -e "${BOLD}Passphrase for ${label}${RESET} (leave blank for no passphrase): ")" pass1; echo
+    read -r -s -p "$(echo -e "${BOLD}Confirm passphrase${RESET}: ")" pass2; echo
+    if [[ "$pass1" == "$pass2" ]]; then
+      KEY_PASSPHRASE="$pass1"
+      return 0
+    fi
+    warn "Passphrases do not match — please try again."
+  done
+}
+
+generate_key_pair() {
+  header "Key pair"
+  if [[ -f "$KEY_FILE" ]]; then
+    warn "Key already exists at ${KEY_FILE} — skipping generation"
+  else
+    log "Generating ${KEY_TYPE} key → ${KEY_FILE}"
+    prompt_passphrase "${KEY_FILE}"
+    if [[ "$KEY_TYPE" == "ed25519" ]]; then
+      ssh-keygen -t ed25519 -f "$KEY_FILE" -C "${USER_NAME}@${HOST_NAME}" -N "${KEY_PASSPHRASE}"
+    else
+      ssh-keygen -t rsa -b "$KEY_BITS" -f "$KEY_FILE" -C "${USER_NAME}@${HOST_NAME}" -N "${KEY_PASSPHRASE}"
+    fi
+    chmod 600 "$KEY_FILE"
+    chmod 644 "${KEY_FILE}.pub"
+    log "Key pair created"
+  fi
+}
+
+gh_upload_key() {
+  local pubkey_path="$1" title="$2"
+  [[ -z "$GITHUB_TOKEN" ]] && return 0
+  local pubkey_content http_status
+  pubkey_content="$(cat "$pubkey_path")"
+  http_status=$(curl -s -o /tmp/_gh_key_resp.json -w "%{http_code}" \
+    -X POST "https://api.github.com/user/keys" \
+    -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"${title}\",\"key\":\"${pubkey_content}\"}")
+  case "$http_status" in
+    201) log  "GitHub: key '${title}' uploaded successfully" ;;
+    422) warn "GitHub: key '${title}' already exists — skipping" ;;
+    401) warn "GitHub: bad token (401) — check your PAT has write:public_key scope" ;;
+    *  ) warn "GitHub: unexpected status ${http_status}:"
+         cat /tmp/_gh_key_resp.json ;;
+  esac
+  rm -f /tmp/_gh_key_resp.json
+}
+
+write_client_config() {
+  header "SSH config"
+  if [[ -f "$CONFIG_FILE" && "$BACKUP" == true ]]; then
+    local bak="${CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$CONFIG_FILE" "$bak"
+    log "Existing config backed up → ${bak}"
+  fi
+
+  if [[ -f "$CONFIG_FILE" ]] && grep -qE "^Host[[:space:]]+${HOST_NAME}([[:space:]]|$)" "$CONFIG_FILE"; then
+    warn "Host '${HOST_NAME}' already present in ${CONFIG_FILE} — skipping append"
+  else
+    [[ -f "$CONFIG_FILE" && -s "$CONFIG_FILE" ]] && echo "" >> "$CONFIG_FILE"
+    cat >> "$CONFIG_FILE" <<EOF
+Host ${HOST_NAME}
+    HostName ${HOST_ADDR}
+    User ${USER_NAME}
+    Port ${PORT}
+    IdentityFile ${KEY_FILE}
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+EOF
+    log "Host block appended to ${CONFIG_FILE}"
+  fi
+
+  chmod 600 "$CONFIG_FILE"
+}
+
+setup_local_registration() {
+  header "Local machine self-registration"
+  local LOCAL_USER="${USER}"
+  local LOCAL_HOST="$(hostname 2>/dev/null | cut -d. -f1)"
+  LOCAL_HOST="${LOCAL_HOST:-$(uname -n | cut -d. -f1)}"
+  local LOCAL_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+  LOCAL_IP="${LOCAL_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+  LOCAL_IP="${LOCAL_IP:-127.0.0.1}"
+  local LOCAL_KEY="${SSH_DIR}/id_${KEY_TYPE}_${LOCAL_HOST}"
+
+  log "Detected: user=${LOCAL_USER}  host=${LOCAL_HOST}  ip=${LOCAL_IP}"
+
+  if [[ -f "$LOCAL_KEY" ]]; then
+    warn "Local key already exists at ${LOCAL_KEY} — skipping"
+  else
+    log "Generating local ${KEY_TYPE} identity key → ${LOCAL_KEY}"
+    prompt_passphrase "${LOCAL_KEY}"
+    if [[ "$KEY_TYPE" == "ed25519" ]]; then
+      ssh-keygen -t ed25519 -f "$LOCAL_KEY" -C "${LOCAL_USER}@${LOCAL_HOST}" -N "${KEY_PASSPHRASE}"
+    else
+      ssh-keygen -t rsa -b "$KEY_BITS" -f "$LOCAL_KEY" -C "${LOCAL_USER}@${LOCAL_HOST}" -N "${KEY_PASSPHRASE}"
+    fi
+    chmod 600 "$LOCAL_KEY"
+    chmod 644 "${LOCAL_KEY}.pub"
+    log "Local key pair created"
+  fi
+
+  gh_upload_key "${LOCAL_KEY}.pub" "${LOCAL_USER}@${LOCAL_HOST}"
+
+  if grep -qE "^Host[[:space:]]+${LOCAL_HOST}([[:space:]]|$)" "$CONFIG_FILE" 2>/dev/null; then
+    warn "Host '${LOCAL_HOST}' already in ${CONFIG_FILE} — skipping"
+  else
+    [[ -s "$CONFIG_FILE" ]] && echo "" >> "$CONFIG_FILE"
+    local SELF_IP="$LOCAL_IP"
+    cat >> "$CONFIG_FILE" <<EOF
+Host ${LOCAL_HOST}
+    HostName ${SELF_IP}
+    User ${LOCAL_USER}
+    Port 22
+    IdentityFile ~/.ssh/id_${KEY_TYPE}_${LOCAL_HOST}
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+EOF
+    log "Local host block '${LOCAL_HOST}' appended to ${CONFIG_FILE}"
+  fi
+}
+
+# ── sshd_config hardening helpers ─────────────────────────────────────────────
+sshd_set() {
+  local directive="$1" value="$2" conf="/etc/ssh/sshd_config"
+  if grep -qE "^#?[[:space:]]*${directive}[[:space:]]" "$conf" 2>/dev/null; then
+    sudo sed -i -E "s|^#?[[:space:]]*${directive}[[:space:]].*|${directive} ${value}|" "$conf"
+  else
+    echo "${directive} ${value}" | sudo tee -a "$conf" > /dev/null
+  fi
+}
+
+harden_server() {
+  local conf="/etc/ssh/sshd_config"
+  header "sshd_config hardening"
+
+  command -v sudo &>/dev/null || { warn "sudo not found — skipping hardening"; return 1; }
+  sudo test -f "$conf" || { warn "${conf} not found — skipping hardening"; return 1; }
+
+  local bak="${conf}.bak.$(date +%Y%m%d_%H%M%S)"
+  sudo cp "$conf" "$bak"
+  log "sshd_config backed up → ${bak}"
+
+  # Core values
+  sshd_set "PubkeyAuthentication"    "yes"
+  sshd_set "AuthorizedKeysFile"      ".ssh/authorized_keys"
+  sshd_set "PasswordAuthentication"  "no"
+  sshd_set "ChallengeResponseAuthentication" "no"
+  sshd_set "KbdInteractiveAuthentication"    "no"
+  sshd_set "PermitRootLogin"         "no"
+  sshd_set "PermitEmptyPasswords"    "no"
+  sshd_set "MaxAuthTries"            "3"
+  sshd_set "MaxSessions"             "5"
+  sshd_set "LoginGraceTime"          "30"
+  sshd_set "ClientAliveInterval"     "60"
+  sshd_set "ClientAliveCountMax"     "3"
+  sshd_set "TCPKeepAlive"            "yes"
+  sshd_set "X11Forwarding"           "no"
+  sshd_set "PrintMotd"               "no"
+  sshd_set "Port"                    "${PORT}"
+
+  # New additions
+  sshd_set "AllowTcpForwarding"      "no"
+  if [[ "$ALLOW_FORWARDING" == true ]]; then
+    sshd_set "AllowAgentForwarding"  "yes"
+  else
+    sshd_set "AllowAgentForwarding"  "no"
+  fi
+  sshd_set "PermitUserEnvironment"   "no"
+  sshd_set "IgnoreRhosts"            "yes"
+  sshd_set "MaxStartups"             "10:30:60"
+  sshd_set "StrictModes"             "yes"
+  sshd_set "UsePrivilegeSeparation"  "sandbox"
+  sshd_set "LogLevel"                "VERBOSE"
+  sshd_set "SyslogFacility"          "AUTH"
+  
+  # Host keys recommendations
+  sshd_set "HostKey"                 "/etc/ssh/ssh_host_ed25519_key"
+  sshd_set "HostKey"                 "/etc/ssh/ssh_host_ecdsa_key"
+
+  # Whitelists if provided
+  [[ -n "$ALLOW_USERS" ]] && sshd_set "AllowUsers" "$ALLOW_USERS"
+  [[ -n "$ALLOW_GROUPS" ]] && sshd_set "AllowGroups" "$ALLOW_GROUPS"
+
+  log "Settings applied to ${conf}"
+  return 0
+}
+
+harden_crypto() {
+  header "sshd_config crypto hardening"
+  sshd_set "KexAlgorithms" \
+    "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512"
+  sshd_set "Ciphers" \
+    "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr"
+  sshd_set "MACs" \
+    "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256"
+  sshd_set "HostKeyAlgorithms" \
+    "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384"
+  log "Crypto settings applied"
+}
+
+harden_moduli() {
+  header "/etc/ssh/moduli hardening"
+  local moduli="/etc/ssh/moduli"
+  local safe="${moduli}.safe"
+  
+  if [[ -f "$moduli" ]]; then
+    sudo awk '$5 >= 3071' "$moduli" > "$safe"
+    local original_count safe_count
+    original_count=$(wc -l < "$moduli")
+    safe_count=$(wc -l < "$safe")
+    
+    sudo mv "$safe" "$moduli"
+    sudo chmod 644 "$moduli"
+    log "moduli: removed $((original_count - safe_count)) weak DH groups"
+  else
+    warn "File $moduli not found, skipping"
+  fi
+}
+
+generate_match_blocks() {
+  header "sshd_config match blocks"
+  local conf="/etc/ssh/sshd_config"
+  local blocks=""
+  local applied_blocks=false
+
+  if [[ -n "$SFTP_GROUP" ]]; then
+    blocks+="
+Match Group ${SFTP_GROUP}
+    ChrootDirectory /sftp/%u
+    ForceCommand internal-sftp -l VERBOSE
+    PasswordAuthentication no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTTY no
+"
+    applied_blocks=true
+  fi
+
+  if [[ -n "$INTERNAL_CIDR" ]]; then
+    blocks+="
+Match Address ${INTERNAL_CIDR}
+    PasswordAuthentication yes
+    MaxAuthTries 5
+"
+    applied_blocks=true
+  fi
+
+  if [[ -n "$ADMIN_GROUP" && -n "$MANAGEMENT_PORT" ]]; then
+    blocks+="
+Match Group ${ADMIN_GROUP} LocalPort ${MANAGEMENT_PORT}
+    AllowTcpForwarding yes
+    AllowAgentForwarding yes
+    MaxSessions 10
+"
+    applied_blocks=true
+  fi
+
+  if [[ "$applied_blocks" == true ]]; then
+    echo "$blocks" | sudo tee -a "$conf" > /dev/null
+    log "Match blocks written"
+  else
+    log "No match blocks requested"
+  fi
+}
+
+validate_config() {
+  header "Post-install Validation"
+  if sudo sshd -t 2>/dev/null; then
+    log "Syntax OK"
+    
+    local effective
+    effective=$(sudo sshd -T 2>/dev/null)
+    
+    check_directive() {
+      local key="$1" expected="$2"
+      local actual
+      actual=$(echo "$effective" | grep -i "^${key} " | awk '{print $2}')
+      
+      if [[ -z "$actual" ]]; then
+        return
+      fi
+
+      if [[ "${actual,,}" == "${expected,,}" ]]; then
+        log "${key}: ${actual}"
+      else
+        warn "${key}: expected '${expected}', got '${actual}'"
+      fi
+    }
+    
+    check_directive "passwordauthentication" "no"
+    check_directive "permitrootlogin" "no"
+    check_directive "x11forwarding" "no"
+    check_directive "pubkeyauthentication" "yes"
+    check_directive "maxauthtries" "3"
+
+    if systemctl is-active --quiet ssh 2>/dev/null; then
+      sudo systemctl reload ssh   && log "ssh service reloaded"
+    elif systemctl is-active --quiet sshd 2>/dev/null; then
+      sudo systemctl reload sshd  && log "sshd service reloaded"
+    else
+      warn "Could not detect running ssh/sshd service — reload manually"
+    fi
+
+    if [[ -n "$HOST_NAME" ]]; then
+      if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "${HOST_NAME}" exit 0 2>/dev/null; then
+        log "Connection test passed"
+      else
+        warn "Connection test failed — add your public key to the server first"
+      fi
+    fi
+  else
+    warn "sshd config syntax error — restoring backup might be necessary."
+  fi
+}
+
+setup_fail2ban() {
+  header "fail2ban Setup"
+  command -v fail2ban-server &>/dev/null || {
+    warn "fail2ban not installed — installing..."
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y fail2ban 2>/dev/null
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y fail2ban 2>/dev/null
+    else
+      warn "Could not install fail2ban via apt or dnf"
+      return
+    fi
+  }
+
+  sudo mkdir -p /etc/fail2ban/jail.d
+  sudo tee /etc/fail2ban/jail.d/sshd.conf > /dev/null <<EOF
+[sshd]
+enabled = true
+port = ${PORT}
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+findtime = 600
+bantime = 3600
+EOF
+
+  sudo systemctl enable --now fail2ban 2>/dev/null || warn "Failed to enable fail2ban service"
+  log "fail2ban configured for SSH on port ${PORT}"
+}
+
+setup_authorized_key() {
+  local pubkey
+  pubkey=$(cat "${KEY_FILE}.pub")
+  local options=""
+  
+  [[ -n "$FROM_IP" ]] && options+="from=\"${FROM_IP}\","
+  [[ -n "$FORCE_COMMAND" ]] && options+="command=\"${FORCE_COMMAND}\","
+  
+  options+="no-agent-forwarding,no-x11-forwarding,no-pty "
+  
+  echo "${options}${pubkey}"
+}
+
+# ── Fetch GitHub keys into this machine's authorized_keys ─────────────────────
+fetch_github_authorized_keys() {
+  [[ -z "$GITHUB_USER" ]] && return 0
+  header "Fetching authorized_keys from GitHub (${GITHUB_USER})"
+
+  local auth_keys="${HOME}/.ssh/authorized_keys"
+  local gh_keys
+
+  if ! gh_keys=$(curl -fsSL "https://github.com/${GITHUB_USER}.keys" 2>/dev/null) || [[ -z "$gh_keys" ]]; then
+    warn "Could not fetch keys from https://github.com/${GITHUB_USER}.keys — check your GitHub username"
+    return 1
+  fi
+
+  # Ensure authorized_keys exists with tight permissions
+  touch "$auth_keys"
+  chmod 600 "$auth_keys"
+
+  local added=0
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    if ! grep -qF "$key" "$auth_keys"; then
+      echo "$key" >> "$auth_keys"
+      (( added++ )) || true
+    fi
+  done <<< "$gh_keys"
+
+  if (( added > 0 )); then
+    log "Added ${added} key(s) from GitHub/${GITHUB_USER} → ${auth_keys}"
+  else
+    log "All GitHub keys already present in ${auth_keys}"
+  fi
+}
+
+# ── Deploy local pubkey to the remote server ──────────────────────────────────
+deploy_pubkey_to_server() {
+  header "Deploying public key to ${USER_NAME}@${HOST_ADDR}:${PORT}"
+
+  if ! command -v ssh-copy-id &>/dev/null; then
+    warn "ssh-copy-id not found — attempting manual key deployment"
+    local pubkey
+    pubkey=$(cat "${KEY_FILE}.pub")
+    if ssh -o BatchMode=no -o StrictHostKeyChecking=accept-new \
+           -p "$PORT" "${USER_NAME}@${HOST_ADDR}" \
+           "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${pubkey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"; then
+      log "Public key deployed via ssh"
+    else
+      warn "Could not deploy key automatically. Run manually:\n  ssh-copy-id -i ${KEY_FILE}.pub -p ${PORT} ${USER_NAME}@${HOST_ADDR}"
+    fi
+    return
+  fi
+
+  if ssh-copy-id -i "${KEY_FILE}.pub" -p "$PORT" "${USER_NAME}@${HOST_ADDR}"; then
+    log "Public key successfully deployed to ${USER_NAME}@${HOST_ADDR}"
+  else
+    warn "ssh-copy-id failed. You may need to deploy the key manually:"
+    warn "  ssh-copy-id -i ${KEY_FILE}.pub -p ${PORT} ${USER_NAME}@${HOST_ADDR}"
+  fi
+
+  # If a GitHub user is set, also pull all their GitHub keys onto the server
+  if [[ -n "$GITHUB_USER" ]]; then
+    log "Pulling all GitHub keys for '${GITHUB_USER}' onto the server..."
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+           -i "$KEY_FILE" -p "$PORT" "${USER_NAME}@${HOST_ADDR}" \
+           "curl -fsSL https://github.com/${GITHUB_USER}.keys | sort -u >> ~/.ssh/authorized_keys && sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys && echo DONE"; then
+      log "GitHub keys for '${GITHUB_USER}' added to server authorized_keys"
+    else
+      warn "Could not pull GitHub keys onto server — do it manually:"
+      warn "  ssh -p ${PORT} ${USER_NAME}@${HOST_ADDR} \"curl -fsSL https://github.com/${GITHUB_USER}.keys >> ~/.ssh/authorized_keys\""
+    fi
+  fi
+}
+
+print_summary() {
+  header "Setup complete"
+  log "Key file   : ${KEY_FILE}"
+  log "Public key : ${KEY_FILE}.pub"
+  log "SSH config : ${CONFIG_FILE}  (Host ${HOST_NAME})"
+  echo
+  echo -e "${BOLD}Test your connection:${RESET}"
+  echo -e "  ${YELLOW}ssh ${HOST_NAME}${RESET}"
+  echo
+  log "Done."
+}
+
+setup_totp() {
+  header "TOTP / Google Authenticator"
+
+  command -v sudo &>/dev/null || { warn "sudo not found — skipping TOTP setup"; return 1; }
+
+  # ── 1. Install libpam-google-authenticator ──────────────────────────────────
+  if ! command -v google-authenticator &>/dev/null; then
+    log "Installing libpam-google-authenticator..."
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y libpam-google-authenticator 2>/dev/null \
+        || { warn "apt install failed — install libpam-google-authenticator manually"; return 1; }
+    elif command -v pacman &>/dev/null; then
+      sudo pacman -S --noconfirm libpam-google-authenticator 2>/dev/null \
+        || { warn "pacman install failed — install libpam-google-authenticator manually"; return 1; }
+    else
+      warn "No supported package manager found (apt/pacman). Install libpam-google-authenticator manually."
+      return 1
+    fi
+  else
+    log "google-authenticator already installed"
+  fi
+
+  # ── 2. Patch /etc/pam.d/sshd ────────────────────────────────────────────────
+  local pam_sshd="/etc/pam.d/sshd"
+  local pam_line="auth required pam_google_authenticator.so nullok"
+  if sudo test -f "$pam_sshd"; then
+    if sudo grep -qF "pam_google_authenticator" "$pam_sshd"; then
+      warn "PAM line already present in ${pam_sshd} — skipping"
+    else
+      local pam_bak="${pam_sshd}.bak.$(date +%Y%m%d_%H%M%S)"
+      sudo cp "$pam_sshd" "$pam_bak"
+      log "${pam_sshd} backed up → ${pam_bak}"
+      # Insert after the first @include or at the top
+      echo "$pam_line" | sudo tee -a "$pam_sshd" >/dev/null
+      log "PAM line appended to ${pam_sshd}"
+    fi
+  else
+    warn "${pam_sshd} not found — skipping PAM config"
+    return 1
+  fi
+
+  # ── 3. Patch sshd_config ─────────────────────────────────────────────────────
+  sshd_set "UsePAM"                          "yes"
+  sshd_set "ChallengeResponseAuthentication" "yes"
+  sshd_set "KbdInteractiveAuthentication"    "yes"
+  sshd_set "AuthenticationMethods"           "publickey,keyboard-interactive"
+  log "sshd_config updated for TOTP (pubkey + keyboard-interactive)"
+
+  # ── 4. Reload sshd ───────────────────────────────────────────────────────────
+  if systemctl is-active --quiet ssh 2>/dev/null; then
+    sudo systemctl reload ssh  && log "ssh service reloaded"
+  elif systemctl is-active --quiet sshd 2>/dev/null; then
+    sudo systemctl reload sshd && log "sshd service reloaded"
+  else
+    warn "Could not detect running ssh/sshd service — reload manually before testing"
+  fi
+
+  # ── 5. Run google-authenticator interactively for the current user ───────────
+  echo
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  echo -e "${BOLD}  Google Authenticator setup — scan the QR code with your app  ${RESET}"
+  echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  echo
+  warn "Do NOT close this session until you have verified TOTP works in a SECOND terminal window."
+  warn "If you get locked out you will need console/OOB access to revert PAM + sshd_config."
+  echo
+  google-authenticator
+
+  echo
+  echo -e "${BOLD}${GREEN}TOTP setup complete. Remember:${RESET}"
+  echo -e "  • 'nullok' in ${pam_sshd} lets unenrolled users still log in."
+  echo -e "    Once all users have enrolled, harden it:"
+  echo -e "    ${YELLOW}sudo sed -i 's/ nullok//' ${pam_sshd}${RESET}"
+  echo -e "  • Each user on this server must run ${BOLD}google-authenticator${RESET} once to enroll."
+  echo -e "  • Connection flow: pubkey ✔ → 6-digit TOTP code ✔ → shell"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+parse_args "$@"
+
+if [[ "$VALIDATE_ONLY" == true ]]; then
+  validate_config
+  exit 0
+fi
+
+validate_required_args
+
+# 1. Ensure ~/.ssh exists
+setup_ssh_dir
+
+# 2. Generate key pair for this machine (prompts for passphrase interactively)
+generate_key_pair
+
+# 3. Upload the new key to GitHub (if token + user provided)
+gh_upload_key "${KEY_FILE}.pub" "${USER_NAME}@${HOST_NAME}"
+
+# 4. Write the client ~/.ssh/config Host block
+write_client_config
+
+# 5. Pull THIS machine's own GitHub-hosted authorized_keys so other machines
+#    (that also upload to GitHub) can SSH in without extra steps
+fetch_github_authorized_keys
+
+# 6. Generate a local identity key and add it to GitHub + local config
+setup_local_registration
+
+# 7. Deploy the local pubkey to the remote server, then also pull all GitHub
+#    keys onto the server so any machine enrolled via GitHub can connect
+deploy_pubkey_to_server
+
+# 8. Optional: harden the sshd_config on this machine
+if [[ "$HARDEN_SERVER" == true ]]; then
+  if harden_server; then
+    [[ "$HARDEN_CRYPTO" == true ]] && harden_crypto
+    [[ "$HARDEN_MODULI" == true ]] && harden_moduli
+    generate_match_blocks
+    validate_config
+  fi
+fi
+
+# 9. Optional: fail2ban
+if [[ "$SETUP_FAIL2BAN" == true ]]; then
+  setup_fail2ban
+fi
+
+# 10. Optional: TOTP 2FA
+if [[ "$SETUP_TOTP" == true ]]; then
+  setup_totp
+fi
+
+print_summary
