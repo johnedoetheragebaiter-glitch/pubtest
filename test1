@@ -43,6 +43,7 @@ FROM_IP=""
 SETUP_FAIL2BAN=false
 SETUP_TOTP=false
 VALIDATE_ONLY=false
+MODE="client"          # client | server | both
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 usage() {
@@ -93,6 +94,10 @@ ${BOLD}SERVER HARDENING${RESET}
                                  the current user (generates QR code + secret).
                                  Best used alongside --harden-server.
       --validate                 Run post-install checks only
+      --mode MODE                client (default) | server | both
+                                   client: generate key + write ~/.ssh/config only
+                                   server: harden /etc/ssh/sshd_config only (no key gen)
+                                   both:   do everything
 
       --help                     Show this help
 EOF
@@ -129,6 +134,7 @@ parse_args() {
       --fail2ban)        SETUP_FAIL2BAN=true; shift ;;
       --totp)            SETUP_TOTP=true;     shift ;;
       --validate)        VALIDATE_ONLY=true; shift ;;
+      --mode)            MODE="$2"; shift 2 ;;
       --help)            usage ;;
       *) error "Unknown option: $1  (run with --help)" ;;
     esac
@@ -136,10 +142,13 @@ parse_args() {
 }
 
 validate_required_args() {
-  [[ -z "$HOST_ADDR" ]] && error "Missing --host-addr"
-  [[ -z "$USER_NAME" ]] && error "Missing --user"
+  [[ "$MODE" =~ ^(client|server|both)$ ]] || error "MODE must be client, server, or both (got: ${MODE})"
+  # --host-addr and --user are only needed when setting up the client side
+  if [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
+    [[ -z "$HOST_ADDR" ]] && error "Missing --host-addr (required for client/both mode)"
+    [[ -z "$USER_NAME" ]] && error "Missing --user (required for client/both mode)"
+  fi
   [[ "$KEY_TYPE" =~ ^(ed25519|rsa)$ ]] || error "KEY_TYPE must be ed25519 or rsa"
-
   [[ -z "$KEY_FILE" ]] && KEY_FILE="${SSH_DIR}/id_${KEY_TYPE}_${HOST_NAME}"
 }
 
@@ -337,13 +346,20 @@ harden_server() {
   sshd_set "IgnoreRhosts"            "yes"
   sshd_set "MaxStartups"             "10:30:60"
   sshd_set "StrictModes"             "yes"
-  sshd_set "UsePrivilegeSeparation"  "sandbox"
+  # UsePrivilegeSeparation was removed in OpenSSH 7.5 (2017) — sandbox mode
+  # is now mandatory and the directive is no longer valid. Actively remove it
+  # from the config in case it was left over from an older system image.
+  sudo sed -i -E "/^#?[[:space:]]*UsePrivilegeSeparation[[:space:]]/d" "$conf"
   sshd_set "LogLevel"                "VERBOSE"
   sshd_set "SyslogFacility"          "AUTH"
   
-  # Host keys recommendations
-  sshd_set "HostKey"                 "/etc/ssh/ssh_host_ed25519_key"
-  sshd_set "HostKey"                 "/etc/ssh/ssh_host_ecdsa_key"
+  # HostKey requires special handling — sshd_config allows multiple HostKey
+  # lines (one per key type). sshd_set uses sed which would replace every
+  # matching line with the same value, leaving duplicates. Instead: delete
+  # all existing HostKey lines (commented or not), then append the two we want.
+  sudo sed -i -E "/^#?[[:space:]]*HostKey[[:space:]]/d" "$conf"
+  printf 'HostKey /etc/ssh/ssh_host_ed25519_key\nHostKey /etc/ssh/ssh_host_ecdsa_key\n' | sudo tee -a "$conf" > /dev/null
+  log "HostKey directives set (ed25519 + ecdsa)"
 
   # Whitelists if provided
   [[ -n "$ALLOW_USERS" ]] && sshd_set "AllowUsers" "$ALLOW_USERS"
@@ -662,12 +678,16 @@ fi
 
 validate_required_args
 
-setup_ssh_dir
-generate_key_pair
-gh_upload_key "${KEY_FILE}.pub" "${USER_NAME}@${HOST_NAME}"
-write_client_config
-setup_local_registration
+# Client-side: generate keys and write ~/.ssh/config
+if [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
+  setup_ssh_dir
+  generate_key_pair
+  gh_upload_key "${KEY_FILE}.pub" "${USER_NAME}@${HOST_NAME}"
+  write_client_config
+  setup_local_registration
+fi
 
+# Server-side: only when explicitly requested
 if [[ "$HARDEN_SERVER" == true ]]; then
   if harden_server; then
     [[ "$HARDEN_CRYPTO" == true ]] && harden_crypto
