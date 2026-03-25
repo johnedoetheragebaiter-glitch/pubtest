@@ -18,7 +18,7 @@ A bash script for automating SSH key generation, client config, and server harde
 ```bash
 git clone https://github.com/johnedoetheragebaiter-glitch/pubtest.git
 cd pubtest
-chmod +x test1
+chmod +x ssh-setup
 ```
 
 ---
@@ -31,9 +31,9 @@ Generates an ed25519 key, writes a `Host` block to `~/.ssh/config`, and prints t
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
-  --user snorlax \
-  --host-name homeserver \
+  --host-addr 1.1.1.1 \
+  --user  user1 \
+  --host-name server1 \
   --port 2222
 ```
 
@@ -48,9 +48,9 @@ ssh homeserver
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 100.68.130.31 \
+  --host-addr 1.1.1.1 \
   --user root \
-  --host-name proxmox \
+  --host-name tailscale1 \
   --port 22
 ```
 
@@ -106,9 +106,9 @@ Run this from a desktop connecting to a fresh server. Does everything: generates
 ```bash
 ./setup_ssh.sh \
   --mode both \
-  --host-addr 192.168.1.50 \
+  --host-addr 1.1.1.1 \
   --user admin \
-  --host-name myserver \
+  --host-name server1 \
   --port 2222 \
   --harden-server \
   --harden-crypto \
@@ -127,9 +127,9 @@ If you export a GitHub personal access token, the script will upload the generat
 ```bash
 export GITHUB_TOKEN="ghp_..."
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
-  --user snorlax \
-  --host-name homeserver \
+  --host-addr 1.1.1.1 \
+  --user user1 \
+  --host-name server1 \
   --github-user yourname
 ```
 
@@ -143,8 +143,8 @@ Fetches your registered keys from `https://github.com/yourname.keys` and checks 
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
-  --user snorlax \
+  --host-addr 1.1.1.1 \
+  --user user1 \
   --github-user yourname \
   --sync-keys
 ```
@@ -153,9 +153,9 @@ Example output:
 ```
 ── GitHub key sync ──
 [✔] Fetched 3 key(s) from github.com/yourname
-[✔]   Registered on GitHub: id_ed25519_homeserver.pub
+[✔]   Registered on GitHub: id_ed25519_server.pub
 [✔]   Registered on GitHub: id_ed25519_github.com.pub
-[!]   NOT on GitHub:        id_ed25519_oldlaptop.pub
+[!]   NOT on GitHub:        id_ed25519_laptop.pub
 [✔] 2 local key(s) confirmed on GitHub
 [!] 1 local key(s) not registered
 ```
@@ -168,8 +168,8 @@ Pulls every public key from your GitHub account and installs them all into the s
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
-  --user snorlax \
+  --host-addr 1.1.1.1 \
+  --user user1 \
   --host-name homeserver \
   --github-user yourname \
   --sync-keys \
@@ -209,7 +209,7 @@ Useful for automated scripts or CI systems — the key can only be used from a k
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
+  --host-addr 1.1.1.1 \
   --user deploy \
   --host-name deployserver \
   --from-ip 10.0.0.5 \
@@ -245,8 +245,8 @@ Runs `sshd -t` to check syntax, prints the effective values of key directives, a
 
 ```bash
 ./setup_ssh.sh \
-  --host-addr 192.168.1.10 \
-  --user snorlax \
+  --host-addr 1.1.1.1 \
+  --user user1 \
   --validate
 ```
 
