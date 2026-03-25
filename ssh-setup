@@ -44,6 +44,8 @@ SETUP_FAIL2BAN=false
 SETUP_TOTP=false
 VALIDATE_ONLY=false
 MODE="client"          # client | server | both
+SYNC_GITHUB_KEYS=false
+DEPLOY_GITHUB_KEYS=false
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 usage() {
@@ -95,6 +97,8 @@ ${BOLD}SERVER HARDENING${RESET}
                                  Best used alongside --harden-server.
       --validate                 Run post-install checks only
       --mode MODE                client (default) | server | both
+      --sync-keys                Fetch keys from GitHub and verify local keys are registered
+      --deploy-keys              With --sync-keys: also push GitHub keys to the server's authorized_keys
                                    client: generate key + write ~/.ssh/config only
                                    server: harden /etc/ssh/sshd_config only (no key gen)
                                    both:   do everything
@@ -135,6 +139,8 @@ parse_args() {
       --totp)            SETUP_TOTP=true;     shift ;;
       --validate)        VALIDATE_ONLY=true; shift ;;
       --mode)            MODE="$2"; shift 2 ;;
+      --sync-keys)       SYNC_GITHUB_KEYS=true; shift ;;
+      --deploy-keys)     DEPLOY_GITHUB_KEYS=true; shift ;;
       --help)            usage ;;
       *) error "Unknown option: $1  (run with --help)" ;;
     esac
@@ -542,6 +548,71 @@ setup_authorized_key() {
   echo "${options}${pubkey}"
 }
 
+verify_github_keys() {
+  header "GitHub key sync"
+
+  # This function needs a GitHub username to know whose keys to fetch.
+  [[ -z "$GITHUB_USER" ]] && { warn "Pass --github-user to use --sync-keys"; return 1; }
+
+  # GitHub exposes every public SSH key for a user at this URL.
+  # It's the same list you see under Settings → SSH keys on the website.
+  local url="https://github.com/${GITHUB_USER}.keys"
+  local gh_keys
+  gh_keys=$(curl -fsSL "$url" 2>/dev/null)
+  if [[ -z "$gh_keys" ]]; then
+    warn "Could not fetch keys from ${url} — check your internet connection"
+    return 1
+  fi
+
+  local key_count
+  key_count=$(echo "$gh_keys" | grep -c "^ssh-")
+  log "Fetched ${key_count} key(s) from github.com/${GITHUB_USER}"
+
+  # ── Verify local keys ────────────────────────────────────────────────────────
+  # For each .pub file in ~/.ssh/, extract just the key material (field 2 —
+  # the base64 blob). We ignore field 1 (key type) and field 3 (comment)
+  # because the comment can differ between machines but the key itself won't.
+  local verified=0 missing=0
+  for pubfile in "${SSH_DIR}"/id_*.pub; do
+    [[ -f "$pubfile" ]] || continue
+    local key_material
+    key_material=$(awk '{print $2}' "$pubfile")
+    if echo "$gh_keys" | grep -qF "$key_material"; then
+      log "  Registered on GitHub: $(basename "$pubfile")"
+      (( verified++ ))
+    else
+      warn "  NOT on GitHub:        $(basename "$pubfile")"
+      (( missing++ ))
+    fi
+  done
+
+  log "${verified} local key(s) confirmed on GitHub"
+  [[ $missing -gt 0 ]] && warn "${missing} local key(s) not registered — run without --sync-keys to upload them"
+
+  # ── Deploy GitHub keys to remote server ─────────────────────────────────────
+  # This is useful for bootstrapping a new server: instead of copying keys
+  # one by one, we pull the full list from GitHub and install all of them at once.
+  if [[ "$DEPLOY_GITHUB_KEYS" == true ]]; then
+    [[ -z "$HOST_ADDR" || -z "$USER_NAME" ]] && {
+      warn "--deploy-keys requires --host-addr and --user"
+      return 1
+    }
+    header "Deploying GitHub keys → ${USER_NAME}@${HOST_NAME}"
+    # Pipe the fetched keys over SSH. The remote command:
+    #   mkdir -p ~/.ssh          — creates .ssh if missing
+    #   chmod 700 ~/.ssh         — correct permissions (SSH refuses to work without this)
+    #   cat >> authorized_keys   — appends the keys
+    #   chmod 600 authorized_keys — correct permissions on the file itself
+    #   sort -u ... -o ...       — deduplicate in place (removes any keys we added twice)
+    echo "$gh_keys" | ssh -p "$PORT" -i "$KEY_FILE" "${USER_NAME}@${HOST_ADDR}" \
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+       cat >> ~/.ssh/authorized_keys && \
+       chmod 600 ~/.ssh/authorized_keys && \
+       sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys"
+    log "GitHub keys deployed and deduplicated on ${HOST_NAME}"
+  fi
+}
+
 print_summary() {
   header "Public key — add this to the server's authorized_keys"
   echo -e "${YELLOW}"
@@ -703,6 +774,10 @@ fi
 
 if [[ "$SETUP_TOTP" == true ]]; then
   setup_totp
+fi
+
+if [[ "$SYNC_GITHUB_KEYS" == true ]]; then
+  verify_github_keys
 fi
 
 print_summary
